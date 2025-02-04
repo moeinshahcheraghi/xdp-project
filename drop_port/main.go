@@ -7,29 +7,29 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 )
 
-// Structure for BPF Map Key-Value
+// BPF key structure (aligned to 8 bytes)
 type KeyValue struct {
 	IP   uint32
 	Port uint16
+	_    uint16 // Padding to match eBPF struct alignment
 }
 
 func main() {
-	// Check command line arguments
-	if len(os.Args) != 4 {
-		log.Fatalf("Usage: %s <interface> <source_ip> <port>\n", os.Args[0])
+	if len(os.Args) < 4 {
+		log.Fatalf("Usage: %s <interface> <source_ip> <port1> [port2] [port3] ...\n", os.Args[0])
 	}
 
-	iface := os.Args[1] // Interface
-	ipStr := os.Args[2] // IP address
-	portStr := os.Args[3] // Port
+	iface := os.Args[1]
+	ipStr := os.Args[2]
+	portStrs := os.Args[3:]
 
-	// Convert IP to uint32
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		log.Fatalf("Invalid IP address: %s\n", ipStr)
@@ -37,17 +37,20 @@ func main() {
 	ip = ip.To4()
 	ipUint := binary.LittleEndian.Uint32(ip)
 
-	// Convert port to uint16
-	var port uint16
-	fmt.Sscanf(portStr, "%d", &port)
+	var ports []uint16
+	for _, p := range portStrs {
+		portNum, err := strconv.Atoi(p)
+		if err != nil || portNum < 1 || portNum > 65535 {
+			log.Fatalf("Invalid port: %s\n", p)
+		}
+		ports = append(ports, uint16(portNum))
+	}
 
-	// Load the XDP program
 	spec, err := ebpf.LoadCollectionSpec("xdp_drop_port.o")
 	if err != nil {
 		log.Fatalf("Failed to load eBPF program: %v", err)
 	}
 
-	// Create BPF map for storing IP and port
 	objs := struct {
 		XdpProg   *ebpf.Program `ebpf:"drop_packet"`
 		IpPortMap *ebpf.Map     `ebpf:"ip_port_map"`
@@ -59,13 +62,16 @@ func main() {
 	defer objs.XdpProg.Close()
 	defer objs.IpPortMap.Close()
 
-	// Add the IP and port to the BPF map
-	err = objs.IpPortMap.Put(ipUint, port)
-	if err != nil {
-		log.Fatalf("Failed to add entry to BPF map: %v", err)
+	for _, port := range ports {
+		key := KeyValue{IP: ipUint, Port: port}
+		value := uint8(1) 
+
+		err = objs.IpPortMap.Put(&key, value)
+		if err != nil {
+			log.Fatalf("Failed to add entry to BPF map: %v", err)
+		}
 	}
 
-	// Attach the XDP program to the interface
 	l, err := link.AttachXDP(link.XDPOptions{
 		Program:   objs.XdpProg,
 		Interface: ifaceIndex(iface),
@@ -75,9 +81,8 @@ func main() {
 	}
 	defer l.Close()
 
-	fmt.Printf("✅ XDP program attached to %s. Blocking %s on port %d\n", iface, ipStr, port)
+	fmt.Printf("✅ XDP program attached to %s. Blocking %s on ports %v\n", iface, ipStr, ports)
 
-	// Handle graceful termination of the program
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
 	<-sig
@@ -85,7 +90,6 @@ func main() {
 	fmt.Println("\n🔻 Detaching XDP program...")
 }
 
-// Get the interface index by its name
 func ifaceIndex(name string) int {
 	iface, err := net.InterfaceByName(name)
 	if err != nil {
