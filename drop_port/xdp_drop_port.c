@@ -4,17 +4,19 @@
 
 #define ETH_P_IP 0x0800
 
-struct ip_port_key {
-    __u32 ip;
-    __u16 port;
-    __u16 __pad;  // Ensure 8-byte alignment
-};
+struct lpm_key {
+    __u32 prefixlen; // CIDR bits for IP + 16 bits for port
+    __u16 port;      // Destination port in host byte order
+    __u32 ip;        // Source IP in network byte order
+    __u8 pad[6];     // Padding to align struct to 16 bytes
+} __attribute__((packed));
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(type, BPF_MAP_TYPE_LPM_TRIE);
     __uint(max_entries, 128);
-    __type(key, struct ip_port_key);
+    __type(key, struct lpm_key);
     __type(value, __u8);
+    __uint(map_flags, BPF_F_NO_PREALLOC);
 } ip_port_map SEC(".maps");
 
 SEC("xdp_drop_port")
@@ -43,14 +45,16 @@ int drop_packet(struct xdp_md *ctx) {
     if ((void *)tcp + sizeof(*tcp) > data_end)
         return XDP_PASS;
 
-    struct ip_port_key key = {
-        .ip = ip->saddr,
+    struct lpm_key lookup_key = {
+        .prefixlen = 48, // 32 bits for IP + 16 bits for port
         .port = bpf_ntohs(tcp->dest),
+        .ip = ip->saddr,
+        .pad = {0}
     };
 
-    __u8 *value = bpf_map_lookup_elem(&ip_port_map, &key);
+    __u8 *value = bpf_map_lookup_elem(&ip_port_map, &lookup_key);
     if (value) {
-        bpf_printk("Dropping packet: src_ip=%u, dest_port=%u", key.ip, key.port);
+        bpf_printk("Dropping packet: src_ip=%u, dest_port=%u", lookup_key.ip, lookup_key.port);
         return XDP_DROP;
     }
 
